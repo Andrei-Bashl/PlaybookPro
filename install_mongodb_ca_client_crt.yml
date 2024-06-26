@@ -1,0 +1,241 @@
+---
+- name: MongoDB server setup with TLS and user creation
+  hosts: mongodb
+  become: true
+  vars:
+    mongo_admin_user: admin
+    mongo_admin_password: qwerty123456
+    mongo_user: user
+    mongo_password: qwe123
+  tasks:
+    - name: Set timezone to Europe/Moscow
+      community.general.timezone:
+        name: Europe/Moscow
+
+    # RUN THIS PLAYBOOK
+
+    - name: Update and upgrade apt packages
+      shell: "apt-get update && apt-get upgrade -y"
+
+    - name: Install required packages
+      ansible.builtin.package:
+        name:
+          - gnupg
+          - curl
+          - python3-pip
+          - openssl
+        state: present
+
+    - name: Add MongoDB GPG key
+      ansible.builtin.shell:
+        cmd: "curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --batch --yes -o /usr/share/keyrings/mongodb-server-7.0.gpg --dearmor"
+
+    - name: Add MongoDB repository
+      ansible.builtin.shell:
+        cmd: 'echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/7.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-7.0.list'
+    
+    - name: Download libssl1.1
+      ansible.builtin.command:
+        cmd: wget http://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2_amd64.deb                                                            
+        chdir: /tmp
+
+    - name: Install libssl1.1
+      ansible.builtin.shell:
+        cmd: dpkg -i /tmp/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+      become: true
+
+    - name: Deleting .deb file libssl1.1
+      ansible.builtin.file:
+        path: /tmp/libssl1.1_1.1.1f-1ubuntu2_amd64.deb
+        state: absent
+
+    - name: Update apt packages after adding MongoDB repository
+      ansible.builtin.shell:
+        cmd: "apt-get update"
+
+    - name: Install MongoDB
+      ansible.builtin.package:
+        name: mongodb-org=7.0.11
+        state: present
+
+    - name: Generate CA certificate
+      ansible.builtin.shell:
+        cmd: |
+          openssl genpkey -algorithm RSA -out /etc/ssl/mongo_ca.key -pkeyopt rsa_keygen_bits:2048
+          openssl req -x509 -new -nodes -key /etc/ssl/mongo_ca.key -sha256 -days 365 -out /etc/ssl/mongo_ca.crt -subj "/CN=MyRootCA"
+      args:
+        creates: /etc/ssl/mongo_ca.crt
+    
+    - name: Get external IP
+      ansible.builtin.shell: "curl -s http://whatismyip.akamai.com/"
+      register: external_ip
+
+    - name: Generate server certificate configuration file
+      ansible.builtin.copy:
+        dest: /etc/ssl/psmdb1.cnf
+        content: |
+          [req]
+          distinguished_name = req_distinguished_name
+          req_extensions = v3_req
+          prompt = no
+
+          [req_distinguished_name]
+          CN = localhost
+
+          [v3_req]
+          keyUsage = critical, digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth, clientAuth
+          subjectAltName = @alt_names
+
+          [alt_names]
+          IP.1 = {{ external_ip.stdout }}
+          DNS.1 = localhost
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Generate server certificate signed by CA
+      ansible.builtin.shell:
+        cmd: |
+          openssl genpkey -algorithm RSA -out /etc/ssl/psmdb1.key -pkeyopt rsa_keygen_bits:2048
+          openssl req -new -key /etc/ssl/psmdb1.key -out /etc/ssl/psmdb1.csr -config /etc/ssl/psmdb1.cnf
+          openssl x509 -req -in /etc/ssl/psmdb1.csr -CA /etc/ssl/mongo_ca.crt -CAkey /etc/ssl/mongo_ca.key -CAcreateserial -out /etc/ssl/psmdb1.crt -days 365 -sha256 -extensions v3_req -extfile /etc/ssl/psmdb1.cnf
+          cat /etc/ssl/psmdb1.key /etc/ssl/psmdb1.crt > /etc/ssl/psmdb1.pem
+
+    - name: Generate client certificate signed by CA
+      ansible.builtin.shell:
+        cmd: |
+          openssl genpkey -algorithm RSA -out /etc/ssl/mongo_client.key -pkeyopt rsa_keygen_bits:2048
+          openssl req -new -key /etc/ssl/mongo_client.key -out /etc/ssl/mongo_client.csr -subj "/CN=client"
+          openssl x509 -req -in /etc/ssl/mongo_client.csr -CA /etc/ssl/mongo_ca.crt -CAkey /etc/ssl/mongo_ca.key -CAcreateserial -out /etc/ssl/mongo_client.crt -days 365 -sha256
+          cat /etc/ssl/mongo_client.key /etc/ssl/mongo_client.crt > /etc/ssl/mongo_client.pem
+      args:
+        creates: /etc/ssl/mongo_client.pem
+
+    - name: Update mongodb config
+      ansible.builtin.template:
+        dest: /etc/mongod.conf
+        src: mongodb/mongod.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Disable authentication in MongoDB config
+      ansible.builtin.lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^  authorization: enabled'
+        line: '  authorization: disabled'
+        insertafter: '^security:'
+        state: present
+
+    - name: Temporarily allow connections without certificates
+      ansible.builtin.lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^    allowConnectionsWithoutCertificates: false'
+        line: '    allowConnectionsWithoutCertificates: true'
+        insertafter: '^    CAFile:'
+        state: present
+
+    - name: Increase vm.max_map_count
+      ansible.builtin.sysctl:
+        name: vm.max_map_count
+        value: 262144
+        state: present
+        reload: yes
+
+    - name: Restart MongoDB to apply new configuration
+      ansible.builtin.systemd:
+        name: mongod
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for MongoDB to start
+      ansible.builtin.wait_for:
+        port: 27017
+        delay: 10
+        timeout: 300
+
+    - name: Install pymongo for MongoDB operations
+      ansible.builtin.pip:
+        name: pymongo
+        state: present
+
+    - name: Create MongoDB admin user
+      community.mongodb.mongodb_user:
+        login_host: localhost
+        login_port: 27017
+        database: admin
+        name: "{{ mongo_admin_user }}"
+        password: "{{ mongo_admin_password }}"
+        roles:
+          - dbAdminAnyDatabase
+          - userAdminAnyDatabase
+          - readWriteAnyDatabase
+          - root
+        state: present
+        tls: true
+        ssl_cert_reqs: CERT_NONE
+        tlsCAFile: /etc/ssl/mongo_ca.crt
+        tlsCertificateKeyFile: /etc/ssl/mongo_client.pem
+
+    - name: Create MongoDB application user
+      community.mongodb.mongodb_user:
+        login_host: localhost
+        login_port: 27017
+        database: admin
+        name: "{{ mongo_user }}"
+        password: "{{ mongo_password }}"
+        roles:
+          - readWriteAnyDatabase
+        state: present
+        tls: true
+        ssl_cert_reqs: CERT_NONE
+        tlsCAFile: /etc/ssl/mongo_ca.crt
+        tlsCertificateKeyFile: /etc/ssl/mongo_client.pem
+
+    - name: Enable authentication in MongoDB config
+      ansible.builtin.lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^  authorization: disabled'
+        line: '  authorization: enabled'
+        insertafter: '^security:'
+        state: present
+
+    - name: Revert to requiring client certificates
+      ansible.builtin.lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^    allowConnectionsWithoutCertificates: true'
+        line: '    allowConnectionsWithoutCertificates: false'
+        insertafter: '^    CAFile:'
+        state: present
+
+    - name: Restart MongoDB to apply enabled authentication and certificate requirements
+      ansible.builtin.systemd:
+        name: mongod
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+    
+    - name: Ensure crt_for_connect directory exists
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/crt_for_connect"
+        state: directory
+        mode: '0755'
+
+    - name: Copy CA certificate to Ansible Controller
+      ansible.builtin.fetch:
+        src: /etc/ssl/mongo_ca.crt
+        dest: "{{ playbook_dir }}/crt_for_connect/mongo_ca.crt"
+        flat: yes
+
+    - name: Copy client certificate to Ansible Controller
+      ansible.builtin.fetch:
+        src: /etc/ssl/mongo_client.pem
+        dest: "{{ playbook_dir }}/crt_for_connect/mongo_client.pem"
+        flat: yes
+    
+
+    - name: Output connection string. Enter WITHOUT ":" in the end
+      pause: 
+        prompt: 'mongosh "mongodb://{{ mongo_admin_user }}:{{ mongo_admin_password }}@{{ external_ip.stdout }}:27017/?tls=true&tlsCAFile={{ playbook_dir }}/crt_for_connect/mongo_ca.crt&tlsCertificateKeyFile={{ playbook_dir }}/crt_for_connect/mongo_client.pem"'
